@@ -108,11 +108,12 @@ def ci(values: list[float]) -> float:
 	return 1.96 * statistics.stdev(values) / math.sqrt(len(values))
 
 
-def summarise(rows: list[dict]) -> dict:
+def summarise(rows: list[dict], bonus: float) -> dict:
 	happy = [r['happiness'] for r in rows]
 	positive = [1.0 if r['positive'] else 0.0 for r in rows]
 	married = [r for r in rows if r['married']]
 	rounds = [r['married_on'] for r in married]
+	married_happy = [r['happiness'] for r in married]
 	return {
 		'n': len(rows),
 		'positive': statistics.fmean(positive),
@@ -120,23 +121,27 @@ def summarise(rows: list[dict]) -> dict:
 		'mean': statistics.fmean(happy),
 		'mean_ci': ci(happy),
 		'married': len(married) / len(rows),
+		'married_mean': statistics.fmean(married_happy) if married else float('nan'),
+		'weak': (
+			sum(1 for h in married_happy if h < 0.5 * bonus) / len(married) if married else 0.0
+		),
 		'bad': sum(1 for r in married if r['happiness'] <= 0) / len(rows),
 		'round': statistics.fmean(rounds) if rounds else float('nan'),
 		'faults': sum(r['faults'] for r in rows),
 	}
 
 
-def by_group(rows: list[dict], market: str) -> dict[str, dict]:
+def by_group(rows: list[dict], market: str, bonus: float) -> dict[str, dict]:
 	groups: dict[str, list[dict]] = {}
 	for r in rows:
 		if r['market'] == market:
 			groups.setdefault(r['group'], []).append(r)
-	return {name: summarise(g) for name, g in groups.items()}
+	return {name: summarise(g, bonus) for name, g in groups.items()}
 
 
 HEADER = (
 	f'{"rank":>4}  {"group":<14}{"positive":>14}{"mean happiness":>20}'
-	f'{"married":>9}{"bad":>6}{"round":>7}{"faults":>8}'
+	f'{"married":>9}{"if married":>11}{"weak":>6}{"bad":>6}{"round":>7}{"faults":>8}'
 )
 
 
@@ -145,12 +150,16 @@ def line(rank: str, name: str, s: dict, mark: str = '') -> str:
 		f'{rank:>4}  {name:<14}'
 		f'{s["positive"]:>8.0%} +/-{s["positive_ci"]:<4.0%}'
 		f'{s["mean"]:>12.1f} +/-{s["mean_ci"]:<6.1f}'
-		f'{s["married"]:>8.0%}{s["bad"]:>6.0%}{s["round"]:>7.1f}{s["faults"]:>8}{mark}'
+		f'{s["married"]:>8.0%}{s["married_mean"]:>11.1f}{s["weak"]:>6.0%}'
+		f'{s["bad"]:>6.0%}{s["round"]:>7.1f}{s["faults"]:>8}{mark}'
 	)
 
 
-MD_COLUMNS = '| Positive | Mean happiness | Married | Bad marriages | Avg round | Faults |'
-MD_RULE = '|---:|---:|---:|---:|---:|---:|'
+MD_COLUMNS = (
+	'| Positive | Mean happiness | Married | Avg if married | Weak marriages '
+	'| Bad marriages | Avg round | Faults |'
+)
+MD_RULE = '|---:|---:|---:|---:|---:|---:|---:|---:|'
 MD_HEADER = f'| Rank | Group {MD_COLUMNS}\n|---:|---{MD_RULE}'
 MD_MARKET_HEADER = f'| Market {MD_COLUMNS}\n|---{MD_RULE}'
 
@@ -159,7 +168,8 @@ def md_row(rank: str, name: str, s: dict) -> str:
 	lead = f'| {rank} | {name} ' if rank else f'| {name} '
 	return (
 		f'{lead}| {s["positive"]:.0%} ± {s["positive_ci"]:.0%} '
-		f'| {s["mean"]:.1f} ± {s["mean_ci"]:.1f} | {s["married"]:.0%} | {s["bad"]:.0%} '
+		f'| {s["mean"]:.1f} ± {s["mean_ci"]:.1f} | {s["married"]:.0%} | {s["married_mean"]:.1f} '
+		f'| {s["weak"]:.0%} | {s["bad"]:.0%} '
 		f'| {s["round"]:.1f} | {s["faults"]} |'
 	)
 
@@ -197,7 +207,9 @@ def write_summary(path: Path, config: str, ranked: list, ours_name: str, solo: d
 	lines += [
 		'',
 		'*Positive* = share ending above 0 (primary goal). *Mean happiness* counts singles as 0 '
-		'(secondary goal). *Bad marriages* = married but ending at or below 0. '
+		'(secondary goal). *Avg if married* = mean over married people only. '
+		'*Weak marriages* = share of marriages scoring under half the bonus. '
+		'*Bad marriages* = married but ending at or below 0. '
 		'± = 95% interval. Ranked by positive rate, then mean happiness.',
 		'',
 	]
@@ -243,7 +255,7 @@ def main() -> None:
 	with ProcessPoolExecutor(max_workers=max(1, extra.jobs)) as pool:
 		rows = [row for result in pool.map(run_one, jobs) for row in result]
 
-	mixed = by_group(rows, 'mixed')
+	mixed = by_group(rows, 'mixed', s.bonus)
 	ranked = sorted(mixed.items(), key=lambda kv: (-kv[1]['positive'], -kv[1]['mean']))
 	samples = ', '.join(sorted({f'{v["n"]}' for v in mixed.values()}))
 	print(f'\nMixed market (people per group across all seeds: {samples})')
@@ -252,7 +264,7 @@ def main() -> None:
 		mark = '   <- us' if name == ours_name else ''
 		print(line(f'{">" if mark else ""}{rank}', name, stats, mark))
 
-	solo = by_group(rows, 'solo')[ours_name] if 'solo' in markets else None
+	solo = by_group(rows, 'solo', s.bonus)[ours_name] if 'solo' in markets else None
 	if solo is not None:
 		print(f'\n{ours_name}: mixed market vs everyone running our code (same seeds, same people)')
 		print(HEADER)
@@ -262,7 +274,8 @@ def main() -> None:
 
 	print(
 		'\npositive = share ending above 0 (primary goal) | mean = average happiness, singles count '
-		'as 0\nbad = married but <= 0 | round = average marriage round | +/- = 95% interval'
+		'as 0\nif married = mean over married only | weak = share of marriages under half the '
+		'bonus\nbad = married but <= 0 | round = average marriage round | +/- = 95% interval'
 	)
 
 	path = Path(extra.csv)
